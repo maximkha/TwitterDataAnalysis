@@ -1,32 +1,23 @@
 #!/usr/bin/env python3
 
-#
-# This script will walk through all the tweet id files and
-# hydrate them with twarc. The line oriented JSON files will
-# be placed right next to each tweet id file.
-#
-# Note: you will need to install twarc, tqdm, and run twarc configure
-# from the command line to tell it your Twitter API keys.
-#
-
-import gzip
-import json
-
 from tqdm import tqdm
-from twarc import Twarc
 from pathlib import Path
+import preprocessor as p 
+import reverse_geocoder as rg
 
-data_dirs = []#['2020-01', '2020-02', '2020-03', '2020-04', '2020-05'] #feb -> may
-
-import os
 import sys
-import pandas as pd
+import os
 
-from geopy.geocoders import Nominatim
+data_dirs = []
+
+import pandas as pd
+import abrevs
 from datetime import datetime
-#from pathlib import Path
 
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# https://pypi.org/project/NRCLex/
+from nrclex import NRCLex
 
 dateTimeFormat = "%a %b %d %H:%M:%S %z %Y"
 
@@ -37,10 +28,32 @@ def insert(df, row):
     else:
         df.loc[insert_loc + 1] = row
 
+def multiCategorySentiment(text):
+    text_object = NRCLex(text)
+    countDict = dict({
+        'fear': 0, 
+        'sadness': 0, 
+        'negative': 0, 
+        'disgust': 0, 
+        'anticip':0, 
+        'joy': 0,
+        'trust': 0,
+        'positive': 0,
+        'surprise': 0,
+        'anger': 0
+        })
+    countDict.update(text_object.raw_emotion_scores)
+    total = sum(countDict.values())
+    if total == 0:
+        return countDict
+    norm = {k: v/total for k, v in countDict.items()}
+    return norm
+
 def main():
     global data_dirs
     global dateTimeFormat
-    geolocator = Nominatim(user_agent="covid19_researcher")
+
+    stateName = abrevs.load("abrevs.txt")
 
     if len(sys.argv) != 2:
         print("Incorrect usage!")
@@ -50,7 +63,8 @@ def main():
     if not os.path.exists(fn):
         print("the path '" + fn + "' does not exist!")
         exit()
-    
+    #fn = r"E:\Akbas\data\coviddata"
+
     data_dirs = list(map(str, [x for x in Path(fn).iterdir() if x.is_dir()]))
 
     data_df = pd.DataFrame(columns = ["time_created", "tweet_id", "user_id", "place_country", "place_full", "lat", "lon", "text"])
@@ -60,41 +74,73 @@ def main():
                 data_df = data_df.append(process(path), ignore_index=True)
 
     #visualization goes here
-    textDate = pd.DataFrame(columns = ["date_time", "state", "sentiment"])
+    textDate = pd.DataFrame(columns = [
+        "date_time", 
+        "state", 
+        "sentiment", 
+        "nrc_fear", 
+        "nrc_anger", 
+        "nrc_anticipation", 
+        "nrc_trust", 
+        "nrc_surprise", 
+        "nrc_positive", 
+        "nrc_negative", 
+        "nrc_sadness", 
+        "nrc_disgust", 
+        "nrc_joy"
+    ])
+    
     analyser = SentimentIntensityAnalyzer()
-    for index, row in data_df.iterrows():
+    for index, row in tqdm(list(data_df.iterrows())):
+        #only US
+        if row["place_country"] != "US":
+            continue
+
         state = "None"
         if row["lat"] == "None" or row["lon"] == "None":
-            try:
-                loc = geolocator.geocode(row["place_full"], addressdetails=True)
-                state = loc.raw["address"]["state"]
-            except:
-                pass
+            state = abrevs.parse_place(row["place_full"], stateName)[1]
         else:
             try:
-                loc = geolocator.reverse(row["lat"] + ", " + row["lon"], addressdetails=True)
-                state = loc.raw["address"]["state"]
+                coordinates = (float(row["lat"]), float(row["lon"])),
+                state = rg.search(coordinates, verbose=False)[0]["admin1"]
             except:
                 pass
-        #might not be the most efficient code!
-        insert(textDate, [datetime.strptime(row["time_created"], dateTimeFormat), state, analyser.polarity_scores(row["text"])["compound"]])
-    
-    stateFilter = ["oklahoma", "new york"]
 
-    import matplotlib.pyplot as plt
-    stateData = textDate.groupby(['state'])
-    for index, row in stateData.iterrows():
-        if row["state"].lower() not in stateFilter and len(stateFilter) != 0:
-            print("Skipping " + row["state"])
-            continue
-        resampled = row.resample('W', on='date_time').mean()
-        #TODO: write to CSV
+        #might not be the most efficient code!
+        cleanText = p.clean(row["text"])
         
-        #plt.plot(resampled["date_time"], resampled["sentiment"], label=row["state"])
-        #plt.plot(row["date_time"], row["sentiment"], label=row["state"])
+        posNegSentiment = analyser.polarity_scores(cleanText)["compound"]
+        catSent = multiCategorySentiment(cleanText)
+        
+        insert(textDate, [
+            datetime.strptime(row["time_created"], dateTimeFormat), 
+            state, 
+            posNegSentiment,
+            catSent["fear"],
+            catSent["anger"],
+            catSent["anticip"],
+            catSent["trust"],
+            catSent["surprise"],
+            catSent["positive"],
+            catSent["negative"],
+            catSent["sadness"],
+            catSent["disgust"],
+            catSent["joy"]
+        ])
     
-    #plt.legend(loc="upper left")
-    #plt.show()
+    stateFilter = []
+
+    stateData = textDate.groupby(['state'])
+    for state, row in stateData:
+        print("state " + state)
+        if state not in stateFilter and len(stateFilter) != 0:
+            print("Skipping " + state)
+            continue
+
+        cleanState = ''.join(e for e in state if e.isalnum())
+
+        row.to_csv(Path("out") / Path(cleanState + ".csv"))
+    
 
 def process(file):
     return pd.read_csv(file, header=None, names=["time_created", "tweet_id", "user_id", "place_country", "place_full", "lat", "lon", "text"])
